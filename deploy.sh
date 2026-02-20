@@ -1,9 +1,14 @@
-#!/usr/bin/env bash
+git a#!/usr/bin/env bash
 # deploy.sh - Deploy EC2 & RDS Auto-Scheduler via AWS CloudShell
 # Creates: IAM Role, Lambda Function, EventBridge Rules
 set -euo pipefail
 
 # ─── Configuration ───────────────────────────────────────────────────────────
+# On CloudShell: credentials are automatic, no profile needed.
+# For local testing: AWS_PROFILE=ce-dev bash deploy.sh
+if [ -n "${AWS_PROFILE:-}" ]; then
+    export AWS_PROFILE
+fi
 REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 FUNCTION_NAME="ec2-rds-auto-scheduler"
 ROLE_NAME="ec2-rds-auto-scheduler-role"
@@ -24,6 +29,7 @@ ZIP_FILE="/tmp/${FUNCTION_NAME}.zip"
 echo "============================================"
 echo " EC2 & RDS Auto-Scheduler - Deployment"
 echo "============================================"
+echo "Profile:       ${AWS_PROFILE:-<default/CloudShell>}"
 echo "Region:        ${REGION}"
 echo "Function:      ${FUNCTION_NAME}"
 echo "IAM Role:      ${ROLE_NAME}"
@@ -198,13 +204,13 @@ aws lambda add-permission \
 # Add Lambda as target for each rule
 aws events put-targets \
     --rule "${START_RULE_NAME}" \
-    --targets "Id=1,Arn=${LAMBDA_ARN},Input={\"action\":\"start\"}" \
+    --targets '[{"Id":"1","Arn":"'"${LAMBDA_ARN}"'","Input":"{\"action\":\"start\"}"}]' \
     --region "${REGION}" >/dev/null
 echo "       Start target added."
 
 aws events put-targets \
     --rule "${STOP_RULE_NAME}" \
-    --targets "Id=1,Arn=${LAMBDA_ARN},Input={\"action\":\"stop\"}" \
+    --targets '[{"Id":"1","Arn":"'"${LAMBDA_ARN}"'","Input":"{\"action\":\"stop\"}"}]' \
     --region "${REGION}" >/dev/null
 echo "       Stop target added."
 

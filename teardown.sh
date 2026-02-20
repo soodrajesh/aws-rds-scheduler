@@ -4,6 +4,11 @@
 set -euo pipefail
 
 # ─── Configuration (must match deploy.sh) ────────────────────────────────────
+# On CloudShell: credentials are automatic, no profile needed.
+# For local testing: AWS_PROFILE=ce-dev bash teardown.sh
+if [ -n "${AWS_PROFILE:-}" ]; then
+    export AWS_PROFILE
+fi
 REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 FUNCTION_NAME="ec2-rds-auto-scheduler"
 ROLE_NAME="ec2-rds-auto-scheduler-role"
