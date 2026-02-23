@@ -122,14 +122,74 @@ Edit the variables at the top of `deploy.sh` and `teardown.sh` to customise:
 | RDS     | Yes                | Standard DB instances                                    |
 | Aurora  | No (not yet)       | Aurora uses `start-db-cluster` / `stop-db-cluster` APIs  |
 
+## RDS Always-Stop Enforcer
+
+### The Problem
+
+AWS automatically restarts stopped RDS instances after 7 days. There is no way to disable this behaviour. If you have dev/test databases you want to keep the data on but never want running, they will silently restart and start costing money.
+
+### The Solution
+
+A separate Lambda (`rds-always-stop-enforcer`) runs **every 6 hours, 24/7** and checks for any RDS instance tagged `AlwaysStopRDS = true` that is in `available` (running) state. If found, it immediately stops it.
+
+```
+┌──────────────────┐       ┌──────────────────────┐       ┌──────────────────────┐
+│  EventBridge     │       │  Lambda Function      │       │  RDS Instances       │
+│                  │       │                       │       │                      │
+│  Every 6 hours   ├──────►│  Find running RDS     ├──────►│  AlwaysStopRDS=true  │
+│  (24/7)          │       │  tagged instances &   │       │                      │
+│                  │       │  stop them            │       │                      │
+└──────────────────┘       └───────────────────────┘       └──────────────────────┘
+```
+
+### Deploy the Enforcer
+
+```bash
+# Requires the main scheduler to be deployed first (for the shared IAM role)
+bash deploy-rds-enforcer.sh
+```
+
+### Tag Your RDS Instances
+
+| Tag Key         | Tag Value |
+|-----------------|-----------|
+| `AlwaysStopRDS` | `true`    |
+
+```bash
+aws rds add-tags-to-resource \
+    --resource-name arn:aws:rds:us-east-1:123456789012:db:my-database \
+    --tags Key=AlwaysStopRDS,Value=true
+```
+
+### Teardown the Enforcer
+
+```bash
+bash teardown-rds-enforcer.sh
+```
+
+This only removes the enforcer Lambda and EventBridge rule. The shared IAM role is not deleted.
+
+## Tag Reference
+
+| Tag Key         | Tag Value | Purpose                                       |
+|-----------------|-----------|-----------------------------------------------|
+| `AutoSchedule`  | `true`    | Start/stop on 9 AM - 9 PM CST schedule        |
+| `AlwaysStopRDS` | `true`    | Keep RDS stopped permanently (enforced 24/7)   |
+
+Both tags can coexist on the same RDS instance. `AlwaysStopRDS` is typically for instances you never want running (dev/test DBs you want to preserve data on but not pay for compute).
+
 ## Project Structure
 
 ```
-aws-rds-scheduler/
-├── deploy.sh              # CloudShell deployment script
-├── teardown.sh            # CloudShell teardown script
+aws-ec2-rds-scheduler/
+├── deploy.sh                  # Scheduler: CloudShell deployment script
+├── teardown.sh                # Scheduler: CloudShell teardown script
 ├── lambda_function/
-│   └── index.py           # Lambda handler (Python 3.12)
+│   └── index.py               # Scheduler: Lambda handler (Python 3.12)
+├── deploy-rds-enforcer.sh     # Enforcer: CloudShell deployment script
+├── teardown-rds-enforcer.sh   # Enforcer: CloudShell teardown script
+├── rds_enforcer/
+│   └── index.py               # Enforcer: Lambda handler (Python 3.12)
 ├── README.md
 └── .gitignore
 ```
@@ -138,6 +198,8 @@ aws-rds-scheduler/
 
 - **Lambda not triggering?** Check EventBridge rules are ENABLED in the console.
 - **Instances not starting/stopping?** Verify the `AutoSchedule = true` tag is set (case-sensitive). Check CloudWatch Logs for the Lambda function.
+- **RDS keeps restarting?** Deploy the RDS Always-Stop Enforcer and tag the instance with `AlwaysStopRDS = true`.
+- **Enforcer not stopping RDS?** Check CloudWatch Logs for `rds-always-stop-enforcer`. Verify the tag is exactly `AlwaysStopRDS` = `true` (case-sensitive).
 - **Permission errors?** Ensure the IAM role has the correct inline policy. Re-run `deploy.sh` to reapply.
 - **Wrong timezone?** See the CDT note above. Adjust cron expressions in `deploy.sh`.
 

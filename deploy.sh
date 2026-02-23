@@ -1,4 +1,4 @@
-git a#!/usr/bin/env bash
+#!/usr/bin/env bash
 # deploy.sh - Deploy EC2 & RDS Auto-Scheduler via AWS CloudShell
 # Creates: IAM Role, Lambda Function, EventBridge Rules
 set -euo pipefail
