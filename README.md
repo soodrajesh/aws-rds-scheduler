@@ -1,208 +1,210 @@
-# EC2 & RDS Auto-Scheduler
+# aws-rds-scheduler
 
-Automatically start and stop EC2 and RDS instances on a schedule using AWS Lambda and EventBridge. Deploy everything from **AWS CloudShell** with a single bash script.
+Tag-based start/stop scheduling for EC2 and RDS, plus a second Lambda that
+deals with a specific RDS annoyance: AWS auto-restarts a stopped DB instance
+after 7 days whether you want it running or not. Both are deployed with plain
+bash and the AWS CLI, no CloudFormation, Terraform, or SAM involved. I built
+this for a handful of dev/test accounts where nobody needed EC2 or RDS running
+outside business hours, and where re-tagging a resource is a lot less friction
+than maintaining a Terraform module for two Lambdas.
 
-## How It Works
+## How it works
 
-1. **Tag your resources** with `AutoSchedule = true`
-2. **Run `deploy.sh`** from AWS CloudShell
-3. EventBridge triggers a Lambda function on a cron schedule:
-   - **Start** at 9:00 AM CST (Mon-Fri)
-   - **Stop** at 9:00 PM CST (Mon-Fri)
-4. The Lambda discovers all tagged EC2 and RDS instances and starts/stops them
+There are two independent pieces:
 
+**1. `ec2-rds-auto-scheduler`** - one Lambda, two EventBridge cron rules. The
+start rule fires at 9 AM CST Monday-Friday, the stop rule fires at 9 PM CST
+Monday-Friday. Each rule invokes the same Lambda with a different payload
+(`{"action": "start"}` or `{"action": "stop"}`). On invocation, the Lambda
+describes EC2 instances and RDS instances tagged `AutoSchedule=true`, filters
+down to whichever ones are actually in a state where the action makes sense
+(only start what's stopped, only stop what's running), and calls
+`start_instances`/`stop_instances` or `start_db_instance`/`stop_db_instance`
+per resource. Nothing is hardcoded to an instance ID - add or remove the tag
+and the next scheduled run picks it up.
+
+**2. `rds-always-stop-enforcer`** - a separate Lambda on a `rate(6 hours)`
+EventBridge rule, running every 6 hours, every day, with no schedule window.
+Its only job is finding RDS instances tagged `AlwaysStopRDS=true` that are
+`available` (running) and stopping them. This exists because AWS force-starts
+a stopped RDS instance after 7 days of being stopped, and there's no setting
+to turn that off. For databases where the requirement is "keep the data,
+never let it run," a scheduler that only fires twice a day isn't enough - the
+7-day auto-restart can happen at any time, so this checks frequently and
+reacts.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph EventBridge
+        R1[Start rule<br/>cron 9AM CST Mon-Fri]
+        R2[Stop rule<br/>cron 9PM CST Mon-Fri]
+        R3[Enforcer rule<br/>rate 6 hours]
+    end
+
+    subgraph Lambda1[Lambda: ec2-rds-auto-scheduler]
+        L1[Describe tagged resources<br/>filter by current state<br/>call start/stop API per resource]
+    end
+
+    subgraph Lambda2[Lambda: rds-always-stop-enforcer]
+        L2[Describe RDS instances<br/>filter running + tagged<br/>call stop_db_instance]
+    end
+
+    R1 -->|action=start| L1
+    R2 -->|action=stop| L1
+    R3 --> L2
+
+    L1 -->|start/stop| EC2[(EC2 instances<br/>tag: AutoSchedule=true)]
+    L1 -->|start/stop| RDS1[(RDS instances<br/>tag: AutoSchedule=true)]
+    L2 -->|stop only| RDS2[(RDS instances<br/>tag: AlwaysStopRDS=true)]
+
+    Role[[Shared IAM role<br/>ec2-rds-auto-scheduler-role]] -.assumed by.-> Lambda1
+    Role -.assumed by.-> Lambda2
 ```
-┌──────────────────┐       ┌──────────────────┐       ┌──────────────────────┐
-│  EventBridge     │       │  Lambda Function  │       │  EC2 / RDS Instances │
-│                  │       │                   │       │                      │
-│  Start: 9AM CST  ├──────►│  Discover tagged  ├──────►│  AutoSchedule=true   │
-│  Stop:  9PM CST  │       │  resources &      │       │                      │
-│  (Mon-Fri)       │       │  start/stop them  │       │                      │
-└──────────────────┘       └──────────────────┘       └──────────────────────┘
-```
 
-## Prerequisites
+Both Lambdas run under the same IAM role (`ec2-rds-auto-scheduler-role`),
+created once by `deploy.sh` and reused by `deploy-rds-enforcer.sh`. That role
+grants `ec2:Describe/Start/StopInstances` and
+`rds:DescribeDBInstances`/`ListTagsForResource`/`Start/StopDBInstance` on
+`Resource: "*"` - IAM doesn't let you scope those actions to "only resources
+with tag X" cleanly, so the safety boundary here is the tag check inside the
+Lambda code, not IAM. That's a real tradeoff: it keeps the policy small and
+avoids maintaining per-resource ARNs, but it means the blast radius of a bug
+in the Lambda is "anything in the account," not "anything tagged." Given
+these are dev/test accounts and the code paths are short and easy to read,
+I decided that was an acceptable risk versus the complexity of scoping IAM by
+tag with condition keys.
 
-- AWS CLI configured (CloudShell has this by default)
-- IAM permissions to create: Lambda functions, IAM roles/policies, EventBridge rules
-- `zip` utility (available in CloudShell)
+The schedule itself is a fixed UTC-6 offset baked into the cron expressions
+in `deploy.sh`, not an actual CST/CDT-aware timezone. That was a deliberate
+simplification - EventBridge cron doesn't understand timezones, and pulling
+in a timezone-aware trigger (e.g. computing offsets in the Lambda instead of
+in the cron expression) felt like more machinery than a "turn things off
+outside office hours" script needs. The cost is that someone has to remember
+to shift the cron by an hour twice a year for daylight saving, which is
+called out in the Troubleshooting section below.
 
-## Quick Start
+## Deploy
 
-### 1. Deploy
+Both scripts are meant to run from AWS CloudShell, where credentials are
+already configured. They also work locally against a named profile.
 
 ```bash
-# Clone or upload this folder to CloudShell, then:
-cd aws-rds-scheduler
+# 1. Deploy the scheduler first - creates the shared IAM role
 bash deploy.sh
+
+# 2. Deploy the enforcer (requires the role from step 1 to already exist)
+bash deploy-rds-enforcer.sh
+
+# Local run against a specific profile instead of CloudShell defaults:
+AWS_PROFILE=your-profile bash deploy.sh
+AWS_PROFILE=your-profile bash deploy-rds-enforcer.sh
 ```
 
-The script will create:
-- IAM Role: `ec2-rds-auto-scheduler-role`
-- Lambda Function: `ec2-rds-auto-scheduler`
-- EventBridge Start Rule: `ec2-rds-auto-scheduler-start`
-- EventBridge Stop Rule: `ec2-rds-auto-scheduler-stop`
+Both scripts are idempotent - re-running `deploy.sh` updates the Lambda code
+and leaves the IAM role and EventBridge rules alone if they already exist.
 
-### 2. Tag Your Resources
+`deploy.sh` creates:
+- IAM role `ec2-rds-auto-scheduler-role` with an inline policy
+- Lambda function `ec2-rds-auto-scheduler` (Python 3.12)
+- EventBridge rules `ec2-rds-auto-scheduler-start` and `ec2-rds-auto-scheduler-stop`
 
-Add the following tag to any EC2 or RDS instance you want scheduled:
+`deploy-rds-enforcer.sh` creates:
+- Lambda function `rds-always-stop-enforcer` (Python 3.12), reusing the role above
+- EventBridge rule `rds-always-stop-enforcer-rule`
 
-| Tag Key        | Tag Value |
-|----------------|-----------|
-| `AutoSchedule` | `true`    |
+### Tag your resources
 
-**EC2 (AWS Console):**
-EC2 > Instances > Select instance > Tags > Manage tags > Add tag
+| Tag | Value | Applies to | Effect |
+|-----|-------|------------|--------|
+| `AutoSchedule` | `true` | EC2, RDS | Start 9 AM / stop 9 PM CST, Mon-Fri |
+| `AlwaysStopRDS` | `true` | RDS only | Re-stopped every 6 hours if AWS brings it back up |
 
-**EC2 (CLI):**
 ```bash
-aws ec2 create-tags --resources i-0123456789abcdef0 --tags Key=AutoSchedule,Value=true
-```
+aws ec2 create-tags --resources i-0123456789abcdef0 \
+    --tags Key=AutoSchedule,Value=true
 
-**RDS (AWS Console):**
-RDS > Databases > Select DB > Tags > Add tag
-
-**RDS (CLI):**
-```bash
 aws rds add-tags-to-resource \
     --resource-name arn:aws:rds:us-east-1:123456789012:db:my-database \
     --tags Key=AutoSchedule,Value=true
 ```
 
-### 3. Verify
+Tags are case-sensitive. Both tags can be set on the same RDS instance -
+`AutoSchedule` handles the daily business-hours window, `AlwaysStopRDS`
+handles the case where you never want it running at all.
 
-- Check **EventBridge > Rules** in the AWS Console to see the two scheduled rules
-- Check **Lambda > Functions > ec2-rds-auto-scheduler** to see the function
-- Check **CloudWatch Logs** after the first trigger to verify execution
-
-### 4. Teardown
-
-To remove all created resources:
+### Teardown
 
 ```bash
-bash teardown.sh
+bash teardown-rds-enforcer.sh   # remove the enforcer first
+bash teardown.sh                # remove the scheduler and the shared IAM role
 ```
 
-## Schedule Details
-
-| Action | CST Time           | UTC Time           | Days     |
-|--------|--------------------|--------------------| ---------|
-| Start  | 9:00 AM CST        | 3:00 PM (15:00) UTC | Mon-Fri  |
-| Stop   | 9:00 PM CST        | 3:00 AM (03:00) UTC | Tue-Sat* |
-
-*The stop rule fires Tue-Sat in UTC because 9 PM CST Monday = 3 AM UTC Tuesday.
-
-### Daylight Saving Time (CDT) Note
-
-The schedule uses **CST (UTC-6)** as a fixed offset. During Central Daylight Time (CDT, UTC-5, typically Mar-Nov), the effective local times shift by one hour:
-- Start becomes **10:00 AM CDT**
-- Stop becomes **10:00 PM CDT**
-
-To adjust for CDT, update the cron expressions in `deploy.sh`:
-- Start: `cron(0 14 ? * MON-FRI *)` (9 AM CDT = 14:00 UTC)
-- Stop: `cron(0 2 ? * TUE-SAT *)` (9 PM CDT = 02:00 UTC)
+Order matters: the enforcer's IAM role is the scheduler's role, so tearing
+down the scheduler first would leave the enforcer's Lambda without a valid
+role reference on its next update.
 
 ## Configuration
 
-Edit the variables at the top of `deploy.sh` and `teardown.sh` to customise:
+Everything configurable lives as variables at the top of `deploy.sh` and
+`deploy-rds-enforcer.sh` - there's no parameter store, config file, or CLI
+flags:
 
-| Variable         | Default                        | Description                    |
-|------------------|--------------------------------|--------------------------------|
-| `REGION`         | `us-east-1`                    | AWS region                     |
-| `FUNCTION_NAME`  | `ec2-rds-auto-scheduler`       | Lambda function name           |
-| `ROLE_NAME`      | `ec2-rds-auto-scheduler-role`  | IAM role name                  |
-| `START_CRON`     | `cron(0 15 ? * MON-FRI *)`    | Start schedule (UTC)           |
-| `STOP_CRON`      | `cron(0 3 ? * TUE-SAT *)`     | Stop schedule (UTC)            |
+| Variable | Default | Where |
+|----------|---------|-------|
+| `REGION` | `us-east-1` (or `$AWS_DEFAULT_REGION`) | both deploy scripts |
+| `FUNCTION_NAME` | `ec2-rds-auto-scheduler` / `rds-always-stop-enforcer` | both deploy scripts |
+| `ROLE_NAME` | `ec2-rds-auto-scheduler-role` | `deploy.sh` |
+| `START_CRON` | `cron(0 15 ? * MON-FRI *)` (9 AM CST) | `deploy.sh` |
+| `STOP_CRON` | `cron(0 3 ? * TUE-SAT *)` (9 PM CST) | `deploy.sh` |
+| `SCHEDULE` | `rate(6 hours)` | `deploy-rds-enforcer.sh` |
 
-## Supported Resources
+Note the stop rule's UTC day is `TUE-SAT`, not `MON-FRI` - 9 PM CST on a
+Monday is already 3 AM UTC Tuesday. If you change the schedule, remember the
+UTC day rolls over with it.
 
-| Service | Supported          | Notes                                                    |
-|---------|--------------------|----------------------------------------------------------|
-| EC2     | Yes                | Standard instances (not Spot)                            |
-| RDS     | Yes                | Standard DB instances                                    |
-| Aurora  | No (not yet)       | Aurora uses `start-db-cluster` / `stop-db-cluster` APIs  |
+## Supported resources
 
-## RDS Always-Stop Enforcer
+| Service | Supported | Notes |
+|---------|-----------|-------|
+| EC2 | Yes | Standard instances, not Spot |
+| RDS | Yes | Standard DB instances |
+| Aurora | No | Aurora clusters use `start-db-cluster`/`stop-db-cluster`, a different API this code doesn't call |
 
-### The Problem
-
-AWS automatically restarts stopped RDS instances after 7 days. There is no way to disable this behaviour. If you have dev/test databases you want to keep the data on but never want running, they will silently restart and start costing money.
-
-### The Solution
-
-A separate Lambda (`rds-always-stop-enforcer`) runs **every 6 hours, 24/7** and checks for any RDS instance tagged `AlwaysStopRDS = true` that is in `available` (running) state. If found, it immediately stops it.
-
-```
-┌──────────────────┐       ┌──────────────────────┐       ┌──────────────────────┐
-│  EventBridge     │       │  Lambda Function      │       │  RDS Instances       │
-│                  │       │                       │       │                      │
-│  Every 6 hours   ├──────►│  Find running RDS     ├──────►│  AlwaysStopRDS=true  │
-│  (24/7)          │       │  tagged instances &   │       │                      │
-│                  │       │  stop them            │       │                      │
-└──────────────────┘       └───────────────────────┘       └──────────────────────┘
-```
-
-### Deploy the Enforcer
-
-```bash
-# Requires the main scheduler to be deployed first (for the shared IAM role)
-bash deploy-rds-enforcer.sh
-```
-
-### Tag Your RDS Instances
-
-| Tag Key         | Tag Value |
-|-----------------|-----------|
-| `AlwaysStopRDS` | `true`    |
-
-```bash
-aws rds add-tags-to-resource \
-    --resource-name arn:aws:rds:us-east-1:123456789012:db:my-database \
-    --tags Key=AlwaysStopRDS,Value=true
-```
-
-### Teardown the Enforcer
-
-```bash
-bash teardown-rds-enforcer.sh
-```
-
-This only removes the enforcer Lambda and EventBridge rule. The shared IAM role is not deleted.
-
-## Tag Reference
-
-| Tag Key         | Tag Value | Purpose                                       |
-|-----------------|-----------|-----------------------------------------------|
-| `AutoSchedule`  | `true`    | Start/stop on 9 AM - 9 PM CST schedule        |
-| `AlwaysStopRDS` | `true`    | Keep RDS stopped permanently (enforced 24/7)   |
-
-Both tags can coexist on the same RDS instance. `AlwaysStopRDS` is typically for instances you never want running (dev/test DBs you want to preserve data on but not pay for compute).
-
-## Project Structure
+## Project structure
 
 ```
-aws-ec2-rds-scheduler/
-├── deploy.sh                  # Scheduler: CloudShell deployment script
-├── teardown.sh                # Scheduler: CloudShell teardown script
+aws-rds-scheduler/
+├── deploy.sh                  # Scheduler: creates IAM role, Lambda, EventBridge rules
+├── teardown.sh                # Scheduler: removes everything deploy.sh created
 ├── lambda_function/
-│   └── index.py               # Scheduler: Lambda handler (Python 3.12)
-├── deploy-rds-enforcer.sh     # Enforcer: CloudShell deployment script
-├── teardown-rds-enforcer.sh   # Enforcer: CloudShell teardown script
+│   └── index.py               # Scheduler Lambda handler (Python 3.12)
+├── deploy-rds-enforcer.sh     # Enforcer: creates Lambda + rule, reuses the scheduler's IAM role
+├── teardown-rds-enforcer.sh   # Enforcer: removes the enforcer Lambda + rule only
 ├── rds_enforcer/
-│   └── index.py               # Enforcer: Lambda handler (Python 3.12)
+│   └── index.py               # Enforcer Lambda handler (Python 3.12)
 ├── README.md
 └── .gitignore
 ```
 
 ## Troubleshooting
 
-- **Lambda not triggering?** Check EventBridge rules are ENABLED in the console.
-- **Instances not starting/stopping?** Verify the `AutoSchedule = true` tag is set (case-sensitive). Check CloudWatch Logs for the Lambda function.
-- **RDS keeps restarting?** Deploy the RDS Always-Stop Enforcer and tag the instance with `AlwaysStopRDS = true`.
-- **Enforcer not stopping RDS?** Check CloudWatch Logs for `rds-always-stop-enforcer`. Verify the tag is exactly `AlwaysStopRDS` = `true` (case-sensitive).
-- **Permission errors?** Ensure the IAM role has the correct inline policy. Re-run `deploy.sh` to reapply.
-- **Wrong timezone?** See the CDT note above. Adjust cron expressions in `deploy.sh`.
+- **Lambda not triggering** - check the EventBridge rules are `ENABLED` in the console.
+- **Instances not starting/stopping** - confirm the `AutoSchedule=true` tag is set exactly (case-sensitive), and check CloudWatch Logs for `ec2-rds-auto-scheduler`.
+- **RDS keeps restarting on its own** - that's the AWS 7-day auto-restart. Deploy the enforcer and tag the instance `AlwaysStopRDS=true`.
+- **Enforcer not stopping RDS** - check CloudWatch Logs for `rds-always-stop-enforcer`, and confirm the tag key/value match exactly.
+- **Permission errors** - re-run `deploy.sh`, it reapplies the inline policy on the shared role.
+- **Wrong local time** - the cron expressions are a fixed UTC-6 (CST) offset, not DST-aware. During CDT (roughly March-November), shift both crons by one hour: start `cron(0 14 ? * MON-FRI *)`, stop `cron(0 2 ? * TUE-SAT *)`.
 
-## Created
+## Known gaps
 
-February 20, 2026
+- No tests. There's no unit test suite and nothing runs in CI on this repo - the Lambdas have only been validated by deploying and watching CloudWatch Logs.
+- No failure notifications. Both Lambdas log per-resource success/failure to CloudWatch, but nothing pages or emails anyone if a stop/start call fails - you have to go looking in the logs.
+- No retry logic. If `start_db_instance` or `stop_db_instance` throws (e.g. the instance is mid-transition), the error is logged and that resource is simply skipped until the next scheduled run - there's no backoff or re-attempt within the same invocation.
+- Single account, single region. `REGION` is one value per deploy; running this across multiple accounts or regions means running the deploy scripts separately in each one, there's no fan-out.
+- Fixed CST offset, not real timezone handling. DST transitions require manually editing the cron expressions in `deploy.sh` and redeploying - covered in Troubleshooting, but it's a manual step that's easy to forget twice a year.
+- No Aurora support. Aurora clusters need `start-db-cluster`/`stop-db-cluster`, which this code doesn't call.
+- Broad IAM scope. The shared role's EC2/RDS permissions are `Resource: "*"` rather than scoped to specific resources or tags, because IAM can't easily condition start/stop actions on an arbitrary tag. The tag check happens in application code, not at the IAM layer.
+- No dry-run mode. There's no way to preview which resources a given invocation would touch without actually calling the start/stop API.
+- No safeguard against mistagging. Tagging a resource `AutoSchedule=true` (or `AlwaysStopRDS=true`) by accident schedules it immediately, since the Lambda has no allowlist or confirmation step.
